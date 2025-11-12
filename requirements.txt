@@ -1,0 +1,4 @@
+aiogram==2.24
+python-dotenv
+aiosqlite
+openpyxl
