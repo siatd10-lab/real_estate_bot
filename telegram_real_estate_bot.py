@@ -1,16 +1,22 @@
-
 """
-Telegram Real Estate Checkup Bot
+Telegram Real Estate Checkup Bot (enhanced)
 File: telegram_real_estate_bot.py
 
-Requirements:
-  pip install aiogram==2.24 python-dotenv aiosqlite openpyxl
+Tested with:
+  aiogram==2.25.1
+  python 3.10.x
 
-Configuration (.env in project root):
+Environment (.env or Render Environment):
   BOT_TOKEN=<your_bot_token>
-  ADMIN_CHAT_ID=<expert_or_crm_incoming_chat_id>
+  ADMIN_CHAT_ID=<admin_user_id>
+
+Improvements:
+- Added "Готово" button on docs step so users never get stuck.
+- Added /skipdocs to skip document upload explicitly.
+- Added /confirm to force show confirmation screen (if required fields filled).
+- Added /whoami to show user's chat_id for quick admin check.
 """
-import asyncio
+
 import logging
 import os
 import re
@@ -31,6 +37,7 @@ import aiosqlite
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '0'))
+
 UPLOAD_DIR = Path('./uploads')
 DB_PATH = Path('./requests.db')
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -115,7 +122,24 @@ async def save_request_to_db(rec: dict):
         )
         await db.commit()
 
-# -------------------- Command Handlers --------------------
+def kb_cancel_only() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add('Отмена')
+    return kb
+
+def kb_docs() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row('Загрузить документ', 'Пропустить', 'Готово')
+    kb.add('Отмена')
+    return kb
+
+def kb_confirm() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add('Отправить эксперту', 'Изменить данные')
+    kb.add('Отмена')
+    return kb
+
+# -------------------- Commands --------------------
 @dp.message_handler(commands=['start', 'help'])
 async def cmd_start(message: types.Message):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -123,21 +147,23 @@ async def cmd_start(message: types.Message):
     kb.add('Отмена')
     await message.answer(
         'Привет! 👋 Я помогу подготовить запрос на проверку объекта недвижимости.\n\n'
-        'Нажмите «Создать новый запрос», чтобы начать.', reply_markup=kb
+        'Нажмите «Создать новый запрос», чтобы начать.',
+        reply_markup=kb
     )
+
+@dp.message_handler(commands=['whoami'])
+async def cmd_whoami(message: types.Message):
+    await message.answer(f"Ваш chat_id: <code>{message.from_user.id}</code>", parse_mode=ParseMode.HTML)
 
 @dp.message_handler(lambda m: m.text == 'Отмена')
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.finish()
-    kb = types.ReplyKeyboardRemove()
-    await message.answer('Операция отменена. Если нужно — начните заново.', reply_markup=kb)
+    await message.answer('Операция отменена. Если нужно — начните заново.', reply_markup=types.ReplyKeyboardRemove())
 
 @dp.message_handler(lambda m: m.text == 'Создать новый запрос')
 async def start_request(message: types.Message):
     await CheckUpStates.ADDRESS.set()
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add('Отмена')
-    await message.answer('Введите адрес объекта (улица, дом, город). Если нет — укажите ориентир или ссылку на карту.', reply_markup=kb)
+    await message.answer('Введите адрес объекта (улица, дом, город). Если нет — укажите ориентир или ссылку на карту.', reply_markup=kb_cancel_only())
 
 # Address
 @dp.message_handler(state=CheckUpStates.ADDRESS, content_types=ContentType.TEXT)
@@ -159,7 +185,7 @@ async def process_cadastral(message: types.Message, state: FSMContext):
     if text.lower() == 'отмена':
         return await cmd_cancel(message, state)
     if not validate_cadastral(text):
-        await message.reply('Неправильный формат кадастрового номера. Проверьте и введите в формате: 77:01:0004010:1234 или напишите "нет".')
+        await message.reply('Неправильный формат кадастрового номера. Введите в формате 77:01:0004010:1234 или напишите "нет".')
         return
     await state.update_data(cadastral=text)
     await CheckUpStates.WHO.set()
@@ -176,17 +202,14 @@ async def process_who(message: types.Message, state: FSMContext):
         return await cmd_cancel(message, state)
     if text == 'Другое':
         await CheckUpStates.WHO_OTHER.set()
-        await message.answer('Напишите, пожалуйста, кем вы являетесь (например, "юрист покупателя").')
+        await message.answer('Напишите, пожалуйста, кем вы являетесь (например, "юрист покупателя").', reply_markup=kb_cancel_only())
         return
     if text not in ('Агент', 'Владелец'):
         await message.reply('Выберите один из вариантов или "Другое".')
         return
     await state.update_data(who=text)
     await CheckUpStates.DOCS.set()
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add('Загрузить документ', 'Пропустить')
-    kb.add('Отмена')
-    await message.answer('Прикрепите документы (PDF, JPG, PNG) или нажмите "Пропустить".', reply_markup=kb)
+    await message.answer('Прикрепите документы (PDF, JPG, PNG) или нажмите «Пропустить» / «Готово».', reply_markup=kb_docs())
 
 @dp.message_handler(state=CheckUpStates.WHO_OTHER, content_types=ContentType.TEXT)
 async def process_who_other(message: types.Message, state: FSMContext):
@@ -195,43 +218,74 @@ async def process_who_other(message: types.Message, state: FSMContext):
         return await cmd_cancel(message, state)
     await state.update_data(who=text)
     await CheckUpStates.DOCS.set()
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row('Загрузить документ', 'Пропустить', 'Готово')
-    kb.add('Отмена')
-    await message.answer('Прикрепите документы (PDF, JPG, PNG) или нажмите "Пропустить".', reply_markup=kb)
+    await message.answer('Прикрепите документы (PDF, JPG, PNG) или нажмите «Пропустить» / «Готово».', reply_markup=kb_docs())
 
-# Files
+# Quick helpers on DOCS
+@dp.message_handler(commands=['skipdocs'])
+async def cmd_skipdocs(message: types.Message, state: FSMContext):
+    cur = await state.get_state()
+    if cur != CheckUpStates.DOCS.state:
+        await message.answer("Команда доступна на шаге загрузки документов.")
+        return
+    await state.update_data(files=[])
+    await CheckUpStates.COMMENT.set()
+    await message.answer('Оставьте комментарий к запросу (или напишите "нет").', reply_markup=kb_cancel_only())
+
+@dp.message_handler(commands=['confirm'])
+async def cmd_force_confirm(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    required = all([data.get('address'), data.get('cadastral') is not None, data.get('who')])
+    if not required:
+        await message.answer("Не хватает данных. Начните заново: /start")
+        return
+    preview = {
+        'id': '—',
+        'user_id': message.from_user.id,
+        'username': message.from_user.username or message.from_user.full_name,
+        'address': data.get('address'),
+        'cadastral': data.get('cadastral'),
+        'who': data.get('who'),
+        'comment': data.get('comment') or 'нет',
+        'files': data.get('files', []),
+        'created_at': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    }
+    txt = fmt_request_message(preview)
+    await CheckUpStates.CONFIRM.set()
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb_confirm())
+
+# Files (DOCS)
 ALLOWED_DOC_TYPES = ('application/pdf', 'image/jpeg', 'image/png')
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 
 @dp.message_handler(state=CheckUpStates.DOCS, content_types=[ContentType.DOCUMENT, ContentType.PHOTO, ContentType.TEXT])
 async def process_docs(message: types.Message, state: FSMContext):
+    # text controls first
     if message.content_type == ContentType.TEXT:
         txt = message.text.strip()
-        if txt == 'Пропустить':
-            await state.update_data(files=[])
-            await CheckUpStates.COMMENT.set()
-            await message.answer('Оставьте комментарий к запросу (или напишите "нет").', reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add('Отмена'))
-            return
-        if txt == 'Загрузить документ':
-            await message.answer('Пришлите файл (PDF/JPG/PNG), либо несколько файлов по очереди. Когда закончите — отправьте "Готово".')
-            return
-        if txt == 'Готово':
+        low = txt.lower()
+        if low == 'отмена':
+            return await cmd_cancel(message, state)
+        if txt in ('Пропустить', 'Готово'):
+            # move on with collected file names (or none)
             data = await state.get_data()
             files = data.get('files', []) or []
             await state.update_data(files=files)
             await CheckUpStates.COMMENT.set()
-            await message.answer('Оставьте комментарий к запросу (или напишите "нет").')
+            await message.answer('Оставьте комментарий к запросу (или напишите "нет").', reply_markup=kb_cancel_only())
             return
-        if txt.lower() == 'отмена':
-            return await cmd_cancel(message, state)
-        await message.reply('Чтобы пропустить — нажмите "Пропустить". Для загрузки файлов — отправьте их, затем "Готово".')
+        if txt == 'Загрузить документ':
+            await message.answer('Пришлите файл (PDF/JPG/PNG). Можно несколько — по одному. Когда закончите — нажмите «Готово».')
+            return
+        # any other text on this step → hint
+        await message.reply('Прикрепите файл, либо нажмите «Пропустить» или «Готово».')
         return
 
-    file_obj = None
+    # file handling
     filename = None
     file_size = None
     mime_type = None
+    file_obj = None
+
     if message.content_type == ContentType.DOCUMENT:
         doc = message.document
         file_size = doc.file_size or 0
@@ -259,6 +313,7 @@ async def process_docs(message: types.Message, state: FSMContext):
     try:
         await bot.download_file(file_obj.file_path, destination=dest.open('wb'))
     except Exception:
+        # fallback
         if message.content_type == ContentType.DOCUMENT:
             await message.document.download(destination_file=str(dest))
         else:
@@ -268,7 +323,7 @@ async def process_docs(message: types.Message, state: FSMContext):
     files = data.get('files', []) or []
     files.append(str(dest.name))
     await state.update_data(files=files)
-    await message.reply(f'Файл {dest.name} сохранён. Отправьте ещё файлы или "Готово" если закончили.')
+    await message.reply(f'Файл {dest.name} сохранён. Отправьте ещё файлы или нажмите «Готово».', reply_markup=kb_docs())
 
 # Comment
 @dp.message_handler(state=CheckUpStates.COMMENT, content_types=ContentType.TEXT)
@@ -292,11 +347,8 @@ async def process_comment(message: types.Message, state: FSMContext):
         'created_at': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     }
     txt = fmt_request_message(preview)
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add('Отправить эксперту', 'Изменить данные')
-    kb.add('Отмена')
     await CheckUpStates.CONFIRM.set()
-    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb_confirm())
 
 # Confirm
 @dp.message_handler(state=CheckUpStates.CONFIRM, content_types=ContentType.TEXT)
@@ -317,29 +369,37 @@ async def process_confirm(message: types.Message, state: FSMContext):
             'created_at': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         }
         await save_request_to_db(rec)
+
+        # send structured message to admin
         txt = fmt_request_message(rec)
-        await bot.send_message(ADMIN_CHAT_ID, txt, parse_mode=ParseMode.HTML)
-        for fname in rec['files']:
-            path = UPLOAD_DIR / fname
-            if path.exists():
-                try:
-                    if path.suffix.lower() == '.pdf':
-                        await bot.send_document(ADMIN_CHAT_ID, open(path, 'rb'))
-                    else:
-                        await bot.send_photo(ADMIN_CHAT_ID, open(path, 'rb'))
-                except Exception:
-                    logger.exception('Failed to send file %s', path)
+        try:
+            await bot.send_message(ADMIN_CHAT_ID, txt, parse_mode=ParseMode.HTML)
+            for fname in rec['files']:
+                path = UPLOAD_DIR / fname
+                if path.exists():
+                    try:
+                        if path.suffix.lower() == '.pdf':
+                            await bot.send_document(ADMIN_CHAT_ID, open(path, 'rb'))
+                        else:
+                            await bot.send_photo(ADMIN_CHAT_ID, open(path, 'rb'))
+                    except Exception:
+                        logger.exception('Failed to send file %s', path)
+        except Exception as e:
+            logger.exception("Failed to notify admin: %s", e)
+
         await message.answer('Спасибо! Ваш запрос отправлен эксперту 🧾', reply_markup=types.ReplyKeyboardRemove())
         await state.finish()
         return
-    elif text == 'Изменить данные':
+
+    if text == 'Изменить данные':
         await CheckUpStates.ADDRESS.set()
-        await message.answer('Давайте изменим. Введите корректный адрес.')
+        await message.answer('Давайте изменим. Введите корректный адрес.', reply_markup=kb_cancel_only())
         return
-    elif text == 'Отмена':
+
+    if text == 'Отмена':
         return await cmd_cancel(message, state)
-    else:
-        await message.reply('Выберите действие: Отправить эксперту / Изменить данные / Отмена.')
+
+    await message.reply('Выберите действие: Отправить эксперту / Изменить данные / Отмена.')
 
 # -------------------- Reports --------------------
 from openpyxl import Workbook
@@ -387,6 +447,7 @@ async def cmd_report(message: types.Message):
     for row in rows:
         ws.append(row)
 
+    # auto width
     for col_num, col_cells in enumerate(ws.columns, start=1):
         length = max(len(str(cell.value)) for cell in col_cells if cell.value)
         ws.column_dimensions[get_column_letter(col_num)].width = min(length + 2, 60)
