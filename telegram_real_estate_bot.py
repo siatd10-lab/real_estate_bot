@@ -196,7 +196,7 @@ async def process_who_other(message: types.Message, state: FSMContext):
     await state.update_data(who=text)
     await CheckUpStates.DOCS.set()
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add('Загрузить документ', 'Пропустить')
+    kb.row('Загрузить документ', 'Пропустить', 'Готово')
     kb.add('Отмена')
     await message.answer('Прикрепите документы (PDF, JPG, PNG) или нажмите "Пропустить".', reply_markup=kb)
 
