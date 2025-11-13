@@ -9,12 +9,12 @@ Telegram Real Estate Checkup Bot
 - Загрузка документов (PDF/JPG/PNG) + кнопки "Пропустить" и "Готово"
 - Комментарий
 - Превью заявки + кнопки "Отправить эксперту" / "Изменить данные"
-- Заявка сохраняется в БД и уходит админу (ADMIN_CHAT_ID)
+- Заявка сохраняется в БД и уходит эксперту
 
 Дополнительно:
 - На шаге документов текст "нет" = "Пропустить"
 - /whoami — показать chat_id пользователю
-- /report <дней> — Excel-отчёт по заявкам (только для ADMIN_CHAT_ID)
+- /report <дней> — Excel-отчёт по заявкам (только для эксперта)
 """
 
 import logging
@@ -37,11 +37,15 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 # ============================================================
-#   НАСТРОЙКИ БОТА (ТВОИ)
+#   НАСТРОЙКИ
 # ============================================================
 
 BOT_TOKEN = "8509916986:AAFuI5YcGsDgRm54n451VrQvKjpG548DULQ"
-ADMIN_CHAT_ID = 924325909  # твой Telegram ID
+
+# Цифровой ID эксперта (по умолчанию); можно потом поправить через /whoami
+ADMIN_CHAT_ID = 924325909
+# username эксперта
+ADMIN_USERNAME = "siatte"
 
 UPLOAD_DIR = Path("./uploads")
 DB_PATH = Path("./requests.db")
@@ -55,7 +59,7 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
 # ============================================================
-#   FSM STATES
+#   FSM
 # ============================================================
 
 class CheckUpStates(StatesGroup):
@@ -100,7 +104,7 @@ def validate_address(text: str) -> bool:
     if not text:
         return False
     parts = text.strip().split()
-    return len(parts) >= 2  # хотя бы два слова
+    return len(parts) >= 2
 
 
 def validate_cadastral(text: str) -> bool:
@@ -130,17 +134,13 @@ def kb_confirm() -> types.ReplyKeyboardMarkup:
 
 
 def esc(value) -> str:
-    """Безопасное экранирование для HTML."""
     if value is None:
         return "-"
     return html.escape(str(value), quote=False)
 
 
 def fmt_preview_for_user(data: dict) -> str:
-    """
-    Превью заявки, которое видит клиент.
-    Без user_id и ID заявки.
-    """
+    """Превью для клиента: без ID и user."""
     lines = []
     lines.append("<b>Проверьте, всё ли верно:</b>")
     lines.append("")
@@ -151,7 +151,7 @@ def fmt_preview_for_user(data: dict) -> str:
 
     files = data.get("files") or []
     if files:
-        files_list = "\n".join([f"- {esc(f)}" for f in files])
+        files_list = "\n".join(f"- {esc(f)}" for f in files)
     else:
         files_list = "файлы не прикреплены"
     lines.append(f"📎 <b>Приложения:</b>\n{files_list}")
@@ -164,10 +164,7 @@ def fmt_preview_for_user(data: dict) -> str:
 
 
 def fmt_admin_message(data: dict) -> str:
-    """
-    Сообщение эксперту.
-    Без user_id, username, ID заявки.
-    """
+    """Сообщение эксперту (такое же можно показывать клиенту)."""
     lines = []
     lines.append("<b>Новый запрос на проверку объекта недвижимости</b>")
     lines.append("")
@@ -178,7 +175,7 @@ def fmt_admin_message(data: dict) -> str:
 
     files = data.get("files") or []
     if files:
-        files_list = "\n".join([f"- {esc(f)}" for f in files])
+        files_list = "\n".join(f"- {esc(f)}" for f in files)
     else:
         files_list = "файлы не прикреплены"
     lines.append(f"📎 <b>Приложения:</b>\n{files_list}")
@@ -189,7 +186,6 @@ def fmt_admin_message(data: dict) -> str:
     lines.append(
         f"\n📅 <b>Дата запроса:</b> {esc(data.get('created_at'))} (UTC)"
     )
-
     return "\n".join(lines)
 
 
@@ -218,7 +214,7 @@ async def save_request_to_db(rec: dict):
 
 
 # ============================================================
-#   БАЗОВЫЕ КОМАНДЫ
+#   КОМАНДЫ
 # ============================================================
 
 @dp.message_handler(commands=["start", "help"], state="*")
@@ -227,6 +223,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("Создать новый запрос")
     kb.add("Отмена")
+
+    # если стартует эксперт (@siatte) — подстрахуемся и обновим ADMIN_CHAT_ID
+    global ADMIN_CHAT_ID
+    if message.from_user.username and message.from_user.username.lower() == ADMIN_USERNAME.lower():
+        ADMIN_CHAT_ID = message.from_user.id
+        logger.info(f"ADMIN_CHAT_ID обновлён из /start: {ADMIN_CHAT_ID}")
+
     await message.answer(
         "Привет! 👋 Я помогу подготовить запрос на проверку объекта недвижимости.\n\n"
         "Нажмите «Создать новый запрос», чтобы начать.",
@@ -372,7 +375,6 @@ MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
     content_types=[ContentType.DOCUMENT, ContentType.PHOTO, ContentType.TEXT],
 )
 async def process_docs(message: types.Message, state: FSMContext):
-    # Текстовые команды на шаге DOCS
     if message.content_type == ContentType.TEXT:
         txt = message.text.strip()
         low = txt.lower()
@@ -380,11 +382,9 @@ async def process_docs(message: types.Message, state: FSMContext):
         if low == "отмена":
             return await cmd_cancel(message, state)
 
-        # "нет" трактуем как "пропустить / готово"
         if txt in ("Пропустить", "Готово") or low == "нет":
             data = await state.get_data()
             files = data.get("files", []) or []
-            # на всякий случай удаляем дубли
             files = list(dict.fromkeys(files))
             await state.update_data(files=files)
             await CheckUpStates.COMMENT.set()
@@ -408,7 +408,7 @@ async def process_docs(message: types.Message, state: FSMContext):
         )
         return
 
-    # Обработка файлов
+    # файлы
     if message.content_type == ContentType.DOCUMENT:
         doc = message.document
         file_size = doc.file_size or 0
@@ -432,7 +432,6 @@ async def process_docs(message: types.Message, state: FSMContext):
 
     dest = UPLOAD_DIR / f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{filename}"
 
-    # сохраняем файл
     if message.content_type == ContentType.DOCUMENT:
         await message.document.download(destination_file=str(dest))
     else:
@@ -440,7 +439,7 @@ async def process_docs(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     files = data.get("files", []) or []
-    if dest.name not in files:  # не даём появиться дублям
+    if dest.name not in files:
         files.append(dest.name)
     await state.update_data(files=files)
 
@@ -458,8 +457,7 @@ async def process_docs(message: types.Message, state: FSMContext):
 @dp.message_handler(state=CheckUpStates.COMMENT, content_types=ContentType.TEXT)
 async def process_comment(message: types.Message, state: FSMContext):
     text = message.text.strip()
-    low = text.lower()
-    if low == "отмена":
+    if text.lower() == "отмена":
         return await cmd_cancel(message, state)
 
     if not text:
@@ -473,7 +471,7 @@ async def process_comment(message: types.Message, state: FSMContext):
         "cadastral": data.get("cadastral"),
         "who": data.get("who"),
         "comment": data.get("comment"),
-        "files": list(dict.fromkeys(data.get("files", []))),  # уникальные файлы
+        "files": list(dict.fromkeys(data.get("files", []))),
     }
 
     txt = fmt_preview_for_user(preview)
@@ -482,7 +480,7 @@ async def process_comment(message: types.Message, state: FSMContext):
 
 
 # ============================================================
-#   ПОДТВЕРЖДЕНИЕ / «ОТПРАВИТЬ ЭКСПЕРТУ»
+#   ПОДТВЕРЖДЕНИЕ / ОТПРАВКА ЭКСПЕРТУ
 # ============================================================
 
 @dp.message_handler(state=CheckUpStates.CONFIRM, content_types=ContentType.TEXT)
@@ -491,7 +489,7 @@ async def process_confirm(message: types.Message, state: FSMContext):
 
     if text == "Отправить эксперту":
         data = await state.get_data()
-        files = list(dict.fromkeys(data.get("files", [])))  # убираем дубли
+        files = list(dict.fromkeys(data.get("files", [])))
 
         req_id = str(uuid.uuid4())
         rec = {
@@ -507,36 +505,45 @@ async def process_confirm(message: types.Message, state: FSMContext):
         }
 
         await save_request_to_db(rec)
-
         txt_admin = fmt_admin_message(rec)
 
-        # --- Пытаемся отправить эксперту по ADMIN_CHAT_ID ---
-        sent_ok = False
+        # определяем, куда слать эксперту
+        # если это сама @siatte — шлём в этот же чат
+        if message.from_user.username and message.from_user.username.lower() == ADMIN_USERNAME.lower():
+            target_chat_id = message.chat.id
+        else:
+            target_chat_id = ADMIN_CHAT_ID
+
         try:
+            # 1) сообщение эксперту
             await bot.send_message(
-                ADMIN_CHAT_ID, txt_admin, parse_mode=ParseMode.HTML
+                target_chat_id, txt_admin, parse_mode=ParseMode.HTML
             )
-            # отправка файлов эксперту
+            # 2) файлы эксперту
             for fname in rec["files"]:
                 path = UPLOAD_DIR / fname
                 if not path.exists():
                     continue
                 try:
                     if path.suffix.lower() == ".pdf":
-                        await bot.send_document(ADMIN_CHAT_ID, open(path, "rb"))
+                        await bot.send_document(target_chat_id, open(path, "rb"))
                     else:
-                        await bot.send_photo(ADMIN_CHAT_ID, open(path, "rb"))
+                        await bot.send_photo(target_chat_id, open(path, "rb"))
                 except Exception:
-                    logger.exception("Failed to send file %s to admin", path)
-            sent_ok = True
-        except Exception as e:
-            logger.exception("Failed to notify admin: %s", e)
+                    logger.exception("Failed to send file %s to expert", path)
 
-        # --- РЕЗЕРВ: если эксперту не ушло, отправляем заявку в текущий чат ---
-        if not sent_ok:
+            # подтверждение клиенту
             await message.answer(
-                "⚠️ Не удалось автоматически отправить заявку эксперту.\n"
-                "Я пришлю её сюда, чтобы вы ничего не потеряли:",
+                "Спасибо! Ваш запрос отправлен эксперту 🧾",
+                reply_markup=types.ReplyKeyboardRemove(),
+            )
+
+        except Exception as e:
+            logger.exception("Failed to send to expert: %s", e)
+            # показываем человеку и дублируем заявку сюда, чтобы не потерять
+            await message.answer(
+                f"⚠️ Не удалось отправить заявку эксперту: {e}\n"
+                "Я пришлю её сюда:",
                 reply_markup=types.ReplyKeyboardRemove(),
             )
             await message.answer(txt_admin, parse_mode=ParseMode.HTML)
@@ -551,11 +558,6 @@ async def process_confirm(message: types.Message, state: FSMContext):
                         await message.answer_photo(open(path, "rb"))
                 except Exception:
                     logger.exception("Failed to send file %s in fallback", path)
-        else:
-            await message.answer(
-                "Спасибо! Ваш запрос отправлен эксперту 🧾",
-                reply_markup=types.ReplyKeyboardRemove(),
-            )
 
         await state.finish()
         return
@@ -578,12 +580,19 @@ async def process_confirm(message: types.Message, state: FSMContext):
 
 
 # ============================================================
-#   ОТЧЁТ ДЛЯ АДМИНА: /report
+#   ОТЧЁТ ДЛЯ ЭКСПЕРТА
 # ============================================================
 
 @dp.message_handler(commands=["report"], state="*")
 async def cmd_report(message: types.Message):
-    if message.from_user.id != ADMIN_CHAT_ID:
+    # отчёт только для эксперта
+    if not (
+        message.from_user.id == ADMIN_CHAT_ID
+        or (
+            message.from_user.username
+            and message.from_user.username.lower() == ADMIN_USERNAME.lower()
+        )
+    ):
         await message.answer("⛔ Эта команда доступна только эксперту.")
         return
 
@@ -644,7 +653,7 @@ async def cmd_report(message: types.Message):
     bio.seek(0)
 
     await bot.send_document(
-        chat_id=ADMIN_CHAT_ID,
+        chat_id=message.chat.id,
         document=types.InputFile(bio, filename=f"requests_report_{days}d.xlsx"),
         caption=f"📈 Отчёт по заявкам за {days} дней",
     )
