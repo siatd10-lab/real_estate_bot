@@ -11,10 +11,10 @@ Telegram Real Estate Checkup Bot
 - Превью заявки + кнопки "Отправить эксперту" / "Изменить данные"
 - Заявка сохраняется в БД и уходит админу (ADMIN_CHAT_ID)
 
-Особенности:
-- На шаге документов текст "нет" = "Пропустить/Готово", то есть бот не застрянет.
-- /whoami — показать chat_id
-- /report <дней> — Excel-отчёт по заявкам (для админа)
+Дополнительно:
+- На шаге документов текст "нет" = "Пропустить"
+- /whoami — показать chat_id пользователю
+- /report <дней> — Excel-отчёт по заявкам (только для ADMIN_CHAT_ID)
 """
 
 import logging
@@ -37,7 +37,7 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 # ============================================================
-# НАСТРОЙКИ БОТА – УЖЕ ЗАПОЛНЕНЫ ПОД ТЕБЯ
+#   НАСТРОЙКИ БОТА (ТВОИ)
 # ============================================================
 
 BOT_TOKEN = "8509916986:AAFuI5YcGsDgRm54n451VrQvKjpG548DULQ"
@@ -55,7 +55,7 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
 # ============================================================
-#    FSM STATES
+#   FSM STATES
 # ============================================================
 
 class CheckUpStates(StatesGroup):
@@ -69,13 +69,14 @@ class CheckUpStates(StatesGroup):
 
 
 # ============================================================
-#    HELPERS
+#   HELPERS
 # ============================================================
 
 CADASTRAL_RE = re.compile(r"^\d{1,3}:\d{1,3}:\d{1,10}:\d{1,10}$")
 
 
 async def init_db():
+    """Создаём таблицу заявок, если её нет."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -99,7 +100,7 @@ def validate_address(text: str) -> bool:
     if not text:
         return False
     parts = text.strip().split()
-    return len(parts) >= 2
+    return len(parts) >= 2  # хотя бы два слова
 
 
 def validate_cadastral(text: str) -> bool:
@@ -135,28 +136,60 @@ def esc(value) -> str:
     return html.escape(str(value), quote=False)
 
 
-def fmt_request_message(data: dict) -> str:
-    """Форматируем текст заявки для админа и превью."""
+def fmt_preview_for_user(data: dict) -> str:
+    """
+    Превью заявки, которое видит клиент.
+    Без user_id и ID заявки.
+    """
     lines = []
-    lines.append("<b>Запрос на проверку объекта недвижимости</b>")
+    lines.append("<b>Проверьте, всё ли верно:</b>")
     lines.append("")
     lines.append(f"🏠 <b>Адрес:</b> {esc(data.get('address'))}")
     cadastral = data.get("cadastral") or "-"
     lines.append(f"📇 <b>Кадастровый номер:</b> {esc(cadastral)}")
-    lines.append(f"👤 <b>Тип заявителя:</b> {esc(data.get('who'))}")
+    lines.append(f"👤 <b>Кто отправляет запрос:</b> {esc(data.get('who'))}")
+
     files = data.get("files") or []
-    files_list = "\n".join([f"- {esc(f)}" for f in files]) if files else "-"
+    if files:
+        files_list = "\n".join([f"- {esc(f)}" for f in files])
+    else:
+        files_list = "файлы не прикреплены"
     lines.append(f"📎 <b>Приложения:</b>\n{files_list}")
+
     comment = data.get("comment") or "-"
     lines.append(f"📝 <b>Комментарий:</b> {esc(comment)}")
+
+    lines.append("\nЕсли всё верно — нажмите «Отправить эксперту».")
+    return "\n".join(lines)
+
+
+def fmt_admin_message(data: dict) -> str:
+    """
+    Сообщение эксперту.
+    Без user_id, username, ID заявки.
+    """
+    lines = []
+    lines.append("<b>Новый запрос на проверку объекта недвижимости</b>")
+    lines.append("")
+    lines.append(f"🏠 <b>Адрес:</b> {esc(data.get('address'))}")
+    cadastral = data.get("cadastral") or "-"
+    lines.append(f"📇 <b>Кадастровый номер:</b> {esc(cadastral)}")
+    lines.append(f"👤 <b>Кто отправляет запрос:</b> {esc(data.get('who'))}")
+
+    files = data.get("files") or []
+    if files:
+        files_list = "\n".join([f"- {esc(f)}" for f in files])
+    else:
+        files_list = "файлы не прикреплены"
+    lines.append(f"📎 <b>Приложения:</b>\n{files_list}")
+
+    comment = data.get("comment") or "-"
+    lines.append(f"📝 <b>Комментарий:</b> {esc(comment)}")
+
     lines.append(
         f"\n📅 <b>Дата запроса:</b> {esc(data.get('created_at'))} (UTC)"
     )
-    uname = data.get("username") or "-"
-    lines.append(
-        f"\n🆔 <b>User:</b> {esc(data.get('user_id'))} ({esc(uname)})"
-    )
-    lines.append(f"🔎 <b>ID заявки:</b> {esc(data.get('id'))}")
+
     return "\n".join(lines)
 
 
@@ -185,7 +218,7 @@ async def save_request_to_db(rec: dict):
 
 
 # ============================================================
-#    БАЗОВЫЕ КОМАНДЫ
+#   БАЗОВЫЕ КОМАНДЫ
 # ============================================================
 
 @dp.message_handler(commands=["start", "help"], state="*")
@@ -222,14 +255,14 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 async def start_request(message: types.Message, state: FSMContext):
     await CheckUpStates.ADDRESS.set()
     await message.answer(
-        "Введите адрес объекта (улица, дом, город). "
+        "Введите адрес объекта (улица, дом, город).\n"
         "Если нет — укажите ориентир или ссылку на карту.",
         reply_markup=kb_cancel_only(),
     )
 
 
 # ============================================================
-#    АДРЕС
+#   АДРЕС
 # ============================================================
 
 @dp.message_handler(state=CheckUpStates.ADDRESS, content_types=ContentType.TEXT)
@@ -237,21 +270,24 @@ async def process_address(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text.lower() == "отмена":
         return await cmd_cancel(message, state)
+
     if not validate_address(text):
         await message.reply(
             "Пожалуйста, укажите более точный адрес (минимум улица + дом или город)."
         )
         return
+
     await state.update_data(address=text)
     await CheckUpStates.CADASTRAL.set()
     await message.answer(
-        'Укажите кадастровый номер (пример: 77:01:0004010:1234) или напишите "нет".',
+        'Укажите кадастровый номер (пример: 77:01:0004010:1234) '
+        'или напишите "нет".',
         reply_markup=kb_cancel_only(),
     )
 
 
 # ============================================================
-#    КАДАСТРОВЫЙ НОМЕР
+#   КАДАСТРОВЫЙ НОМЕР
 # ============================================================
 
 @dp.message_handler(state=CheckUpStates.CADASTRAL, content_types=ContentType.TEXT)
@@ -259,12 +295,14 @@ async def process_cadastral(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text.lower() == "отмена":
         return await cmd_cancel(message, state)
+
     if not validate_cadastral(text):
         await message.reply(
-            "Неправильный формат кадастрового номера. "
+            "Неправильный формат кадастрового номера.\n"
             "Введите в формате 77:01:0004010:1234 или напишите \"нет\"."
         )
         return
+
     await state.update_data(cadastral=text)
     await CheckUpStates.WHO.set()
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -274,28 +312,34 @@ async def process_cadastral(message: types.Message, state: FSMContext):
 
 
 # ============================================================
-#    КТО ЗАЯВИТЕЛЬ
+#   КТО ЗАЯВИТЕЛЬ
 # ============================================================
 
 @dp.message_handler(state=CheckUpStates.WHO, content_types=ContentType.TEXT)
 async def process_who(message: types.Message, state: FSMContext):
     text = message.text.strip()
-    if text.lower() == "отмена":
+    low = text.lower()
+    if low == "отмена":
         return await cmd_cancel(message, state)
+
     if text == "Другое":
         await CheckUpStates.WHO_OTHER.set()
         await message.answer(
-            'Напишите, пожалуйста, кем вы являетесь (например, "юрист покупателя").',
+            'Напишите, пожалуйста, кем вы являетесь '
+            '(например, "юрист покупателя").',
             reply_markup=kb_cancel_only(),
         )
         return
+
     if text not in ("Агент", "Владелец"):
         await message.reply('Выберите один из вариантов или "Другое".')
         return
+
     await state.update_data(who=text)
     await CheckUpStates.DOCS.set()
     await message.answer(
-        "Прикрепите документы (PDF, JPG, PNG) или нажмите «Пропустить» / «Готово».",
+        "Прикрепите документы (PDF, JPG, PNG) или нажмите "
+        "«Пропустить» / «Готово».",
         reply_markup=kb_docs(),
     )
 
@@ -305,16 +349,18 @@ async def process_who_other(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text.lower() == "отмена":
         return await cmd_cancel(message, state)
+
     await state.update_data(who=text)
     await CheckUpStates.DOCS.set()
     await message.answer(
-        "Прикрепите документы (PDF, JPG, PNG) или нажмите «Пропустить» / «Готово».",
+        "Прикрепите документы (PDF, JPG, PNG) или нажмите "
+        "«Пропустить» / «Готово».",
         reply_markup=kb_docs(),
     )
 
 
 # ============================================================
-#    ДОКУМЕНТЫ
+#   ДОКУМЕНТЫ
 # ============================================================
 
 ALLOWED_DOC_TYPES = ("application/pdf", "image/jpeg", "image/png")
@@ -334,10 +380,12 @@ async def process_docs(message: types.Message, state: FSMContext):
         if low == "отмена":
             return await cmd_cancel(message, state)
 
-        # "нет" трактуем как "пропустить"
+        # "нет" трактуем как "пропустить / готово"
         if txt in ("Пропустить", "Готово") or low == "нет":
             data = await state.get_data()
             files = data.get("files", []) or []
+            # на всякий случай удаляем дубли
+            files = list(dict.fromkeys(files))
             await state.update_data(files=files)
             await CheckUpStates.COMMENT.set()
             await message.answer(
@@ -348,33 +396,29 @@ async def process_docs(message: types.Message, state: FSMContext):
 
         if txt == "Загрузить документ":
             await message.answer(
-                "Пришлите файл (PDF/JPG/PNG). Можно несколько — по одному. "
+                "Пришлите файл (PDF/JPG/PNG). Можно несколько — по одному.\n"
                 "Когда закончите — нажмите «Готово».",
                 reply_markup=kb_docs(),
             )
             return
 
-        await message.reply("Прикрепите файл или нажмите «Пропустить» / «Готово».")
+        await message.reply(
+            "Прикрепите файл или нажмите «Пропустить» / «Готово» "
+            "(можно написать просто «нет»)."
+        )
         return
 
     # Обработка файлов
-    filename = None
-    file_size = None
-    mime_type = None
-    file_obj = None
-
     if message.content_type == ContentType.DOCUMENT:
         doc = message.document
         file_size = doc.file_size or 0
         mime_type = doc.mime_type
         filename = doc.file_name or f"doc_{uuid.uuid4()}.pdf"
-        file_obj = await bot.get_file(doc.file_id)
     elif message.content_type == ContentType.PHOTO:
         photo = message.photo[-1]
         file_size = photo.file_size or 0
         mime_type = "image/jpeg"
         filename = f"photo_{uuid.uuid4()}.jpg"
-        file_obj = await bot.get_file(photo.file_id)
     else:
         await message.reply("Неподдерживаемый тип файла.")
         return
@@ -389,36 +433,35 @@ async def process_docs(message: types.Message, state: FSMContext):
     dest = UPLOAD_DIR / f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{filename}"
 
     # сохраняем файл
-    try:
-        await bot.download_file(file_obj.file_path, destination=dest.open("wb"))
-    except Exception:
-        # запасной вариант через message
-        if message.content_type == ContentType.DOCUMENT:
-            await message.document.download(destination_file=str(dest))
-        else:
-            await message.photo[-1].download(destination_file=str(dest))
+    if message.content_type == ContentType.DOCUMENT:
+        await message.document.download(destination_file=str(dest))
+    else:
+        await message.photo[-1].download(destination_file=str(dest))
 
     data = await state.get_data()
     files = data.get("files", []) or []
-    files.append(dest.name)
+    if dest.name not in files:  # не даём появиться дублям
+        files.append(dest.name)
     await state.update_data(files=files)
 
     await message.reply(
-        f"Файл {dest.name} сохранён. "
+        f"Файл {dest.name} сохранён.\n"
         "Отправьте ещё файлы или нажмите «Готово».",
         reply_markup=kb_docs(),
     )
 
 
 # ============================================================
-#    КОММЕНТАРИЙ
+#   КОММЕНТАРИЙ
 # ============================================================
 
 @dp.message_handler(state=CheckUpStates.COMMENT, content_types=ContentType.TEXT)
 async def process_comment(message: types.Message, state: FSMContext):
     text = message.text.strip()
-    if text.lower() == "отмена":
+    low = text.lower()
+    if low == "отмена":
         return await cmd_cancel(message, state)
+
     if not text:
         text = "нет"
 
@@ -426,24 +469,20 @@ async def process_comment(message: types.Message, state: FSMContext):
     data = await state.get_data()
 
     preview = {
-        "id": "—",
-        "user_id": message.from_user.id,
-        "username": message.from_user.username or message.from_user.full_name,
         "address": data.get("address"),
         "cadastral": data.get("cadastral"),
         "who": data.get("who"),
         "comment": data.get("comment"),
-        "files": data.get("files", []),
-        "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "files": list(dict.fromkeys(data.get("files", []))),  # уникальные файлы
     }
 
-    txt = fmt_request_message(preview)
+    txt = fmt_preview_for_user(preview)
     await CheckUpStates.CONFIRM.set()
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb_confirm())
 
 
 # ============================================================
-#    ПОДТВЕРЖДЕНИЕ: «ОТПРАВИТЬ ЭКСПЕРТУ»
+#   ПОДТВЕРЖДЕНИЕ / «ОТПРАВИТЬ ЭКСПЕРТУ»
 # ============================================================
 
 @dp.message_handler(state=CheckUpStates.CONFIRM, content_types=ContentType.TEXT)
@@ -452,6 +491,8 @@ async def process_confirm(message: types.Message, state: FSMContext):
 
     if text == "Отправить эксперту":
         data = await state.get_data()
+        files = list(dict.fromkeys(data.get("files", [])))  # убираем дубли
+
         req_id = str(uuid.uuid4())
         rec = {
             "id": req_id,
@@ -461,18 +502,21 @@ async def process_confirm(message: types.Message, state: FSMContext):
             "cadastral": data.get("cadastral"),
             "who": data.get("who"),
             "comment": data.get("comment"),
-            "files": data.get("files", []),
+            "files": files,
             "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         await save_request_to_db(rec)
 
-        txt = fmt_request_message(rec)
-        # отправляем админу
+        txt_admin = fmt_admin_message(rec)
+
+        # --- Пытаемся отправить эксперту по ADMIN_CHAT_ID ---
+        sent_ok = False
         try:
             await bot.send_message(
-                ADMIN_CHAT_ID, txt, parse_mode=ParseMode.HTML
+                ADMIN_CHAT_ID, txt_admin, parse_mode=ParseMode.HTML
             )
+            # отправка файлов эксперту
             for fname in rec["files"]:
                 path = UPLOAD_DIR / fname
                 if not path.exists():
@@ -483,14 +527,36 @@ async def process_confirm(message: types.Message, state: FSMContext):
                     else:
                         await bot.send_photo(ADMIN_CHAT_ID, open(path, "rb"))
                 except Exception:
-                    logger.exception("Failed to send file %s", path)
+                    logger.exception("Failed to send file %s to admin", path)
+            sent_ok = True
         except Exception as e:
             logger.exception("Failed to notify admin: %s", e)
 
-        await message.answer(
-            "Спасибо! Ваш запрос отправлен эксперту 🧾",
-            reply_markup=types.ReplyKeyboardRemove(),
-        )
+        # --- РЕЗЕРВ: если эксперту не ушло, отправляем заявку в текущий чат ---
+        if not sent_ok:
+            await message.answer(
+                "⚠️ Не удалось автоматически отправить заявку эксперту.\n"
+                "Я пришлю её сюда, чтобы вы ничего не потеряли:",
+                reply_markup=types.ReplyKeyboardRemove(),
+            )
+            await message.answer(txt_admin, parse_mode=ParseMode.HTML)
+            for fname in rec["files"]:
+                path = UPLOAD_DIR / fname
+                if not path.exists():
+                    continue
+                try:
+                    if path.suffix.lower() == ".pdf":
+                        await message.answer_document(open(path, "rb"))
+                    else:
+                        await message.answer_photo(open(path, "rb"))
+                except Exception:
+                    logger.exception("Failed to send file %s in fallback", path)
+        else:
+            await message.answer(
+                "Спасибо! Ваш запрос отправлен эксперту 🧾",
+                reply_markup=types.ReplyKeyboardRemove(),
+            )
+
         await state.finish()
         return
 
@@ -506,12 +572,13 @@ async def process_confirm(message: types.Message, state: FSMContext):
         return await cmd_cancel(message, state)
 
     await message.reply(
-        "Выберите действие: Отправить эксперту / Изменить данные / Отмена."
+        "Выберите действие: «Отправить эксперту», "
+        "«Изменить данные» или «Отмена»."
     )
 
 
 # ============================================================
-#    ОТЧЁТ ДЛЯ АДМИНА: /report
+#   ОТЧЁТ ДЛЯ АДМИНА: /report
 # ============================================================
 
 @dp.message_handler(commands=["report"], state="*")
@@ -584,7 +651,7 @@ async def cmd_report(message: types.Message):
 
 
 # ============================================================
-#    STARTUP
+#   STARTUP
 # ============================================================
 
 async def on_startup(dp: Dispatcher):
